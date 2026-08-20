@@ -12,5 +12,6 @@
     "largeIcon": "assets/icon-130.png",
     "iconColor": "#000b25",
     "id": "org.jellyfin.webos",
-    "disableBackHistoryAPI": true
+    "disableBackHistoryAPI": true,
+    "screenSaverProperties": {"preferredType": 2}
 }

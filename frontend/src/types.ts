@@ -44,3 +44,16 @@ export interface InitMessage {
 export interface MediaSessionInfo {
     [key: string]: any;
 }
+
+/** Media metadata relayed from Jellyfin playback via updateMediaSession */
+export interface MediaInfo {
+    [key: string]: any;
+    title?: string;
+    seriesTitle?: string;
+    season?: number;
+    episode?: number;
+    artwork?: {
+        urls: string[];
+        type?: string;
+    };
+}

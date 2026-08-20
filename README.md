@@ -20,10 +20,31 @@ All Jellyfin webOS code is licensed under the MPL 2.0 license, some parts incorp
 
 ## Development
 
+The app has two parts:
+
+- `frontend/` — the shell (Vite + TypeScript): connection UI, server discovery, and a bridge that wraps the server-hosted Jellyfin web UI in an iframe
+- `services/` — the on-TV Node.js service handling UDP server autodiscovery
+
+### Frontend workflow
+
+```sh
+cd frontend
+npm install
+npm run dev        # Vite dev server (bridge injection is blocked cross-origin in browsers — expected)
+npm run typecheck  # tsc --noEmit
+npm run lint       # eslint
+npm test           # vitest unit tests
+npm run build      # production bundle → dist/
+```
+
+The shell targets ES2017 so it parses on the Chromium engines shipped with webOS 3.x–5.x TVs.
+
+### Packaging & on-TV testing
+
 The general development workflow looks like this:
 
 - Prepare a build environment of your choice (see below)
-- Compile an IPK either with the IDE or with ares-package
+- Compile an IPK either with the IDE or with ares-package (`npm run package` from the repo root builds the frontend and packages `frontend/dist` + `services`)
 - Test the app on the emulator or ares-server or install it on your tv by following http://webostv.developer.lge.com/develop/app-test/
 
 There are three ways to create the required build environment:

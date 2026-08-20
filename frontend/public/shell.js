@@ -158,6 +158,9 @@
 
   // Listen for the 'init' message from the parent shell
   window.addEventListener('message', function (event) {
+    // Security: only accept messages from the parent shell window
+    if (event.source !== window.parent) return;
+
     var msg = event.data;
     if (!msg || !msg.type) return;
 

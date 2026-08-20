@@ -6,16 +6,26 @@
  * and communication between the shell and the Jellyfin iframe.
  */
 
+// webOSTV.js platform library (attaches window.webOS) — from npm, not vendored
+import 'webostvjs';
+
 import { ajax } from './services/ajax';
 import { storage } from './services/storage';
-import { discoverServers } from './services/discovery';
+import { discoverServers, startDiscovery, stopDiscovery } from './services/discovery';
+import { suppressScreensaver, allowScreensaver } from './services/screensaver';
 import { bridge } from './bridge/bridge';
+import { BridgeInbound } from './bridge/messages';
+import { appUI } from './ui/app';
 import { initNavigation, createKeyHandler } from './ui/navigation';
+import { normalizeUrl, validURL, originOf } from './utils/url';
+import { strings } from './ui/strings';
 import type { AppInfo, DeviceInfo, ServerInfo, ConnectedServers } from './types';
 
 // ===== State =====
 let currReq: XMLHttpRequest | null = null;
-let appInfo: AppInfo = {
+let discovered: ServerInfo[] = [];
+let savedServers: ConnectedServers = {};
+const appInfo: AppInfo = {
     deviceId: null,
     deviceName: 'LG Smart TV',
     appName: 'Jellyfin for WebOS',
@@ -34,22 +44,6 @@ function waitForDeviceInfo(callback: (info: DeviceInfo) => void): void {
     }
 }
 
-function normalizeUrl(url: string): string {
-    let normalized = url.trim();
-    if (!normalized.startsWith('http://') && !normalized.startsWith('https://')) {
-        normalized = 'http://' + normalized;
-    }
-    const parts = normalized.split('://');
-    for (let i = 1; i < parts.length; i++) {
-        parts[i] = parts[i].replace(/\/\//g, '/');
-    }
-    return parts.join('://');
-}
-
-function validURL(str: string): boolean {
-    return /^https?:\/\/\S+$/i.test(str);
-}
-
 function generateDeviceId(): string {
     return btoa([navigator.userAgent, new Date().getTime()].join('|')).replace(/=/g, '1');
 }
@@ -63,25 +57,49 @@ function getDeviceId(): string {
     return deviceId!;
 }
 
+// ===== Server List =====
+
+/** Combine discovered and saved servers into a deduplicated list for display */
+function refreshServerList(): void {
+    const seen = new Set<string>();
+    const combined: ServerInfo[] = [];
+
+    for (const server of discovered) {
+        if (!seen.has(server.baseurl)) {
+            seen.add(server.baseurl);
+            combined.push(server);
+        }
+    }
+    for (const id of Object.keys(savedServers)) {
+        const server = savedServers[id];
+        if (server.baseurl && !seen.has(server.baseurl)) {
+            seen.add(server.baseurl);
+            combined.push(server);
+        }
+    }
+
+    appUI.renderServers(combined, (url) => connectToUrl(url));
+}
+
 // ===== Connection Logic =====
 
-function handleServerSelect(): void {
-    const baseurlEl = document.querySelector<HTMLInputElement>('#baseurl');
-    if (!baseurlEl) return;
-
-    const autoConnectEl = document.querySelector<HTMLInputElement>('#auto_connect');
-    const baseurl = normalizeUrl(baseurlEl.value);
-    const autoConnect = autoConnectEl?.checked ?? false;
+/** Entry point for all connection requests (form submit, server card pick) */
+function connectToUrl(rawUrl: string): void {
+    const baseurl = normalizeUrl(rawUrl);
 
     if (!validURL(baseurl)) {
-        displayError('Please enter a valid URL, it needs a scheme (http:// or https://), a hostname or IP and a port (ex. :8096 or :8920).');
+        appUI.showError(strings.errInvalidUrl);
         return;
     }
 
-    displayConnecting();
+    // Persist the chosen URL/auto-connect flag in the form
+    const urlField = document.querySelector<HTMLInputElement>('#baseurl');
+    if (urlField) urlField.value = baseurl;
+    const autoConnectEl = document.querySelector<HTMLInputElement>('#auto_connect');
+
+    appUI.showConnecting();
     if (currReq) currReq.abort();
-    hideError();
-    getServerInfo(baseurl, autoConnect);
+    getServerInfo(baseurl, autoConnectEl?.checked ?? false);
 }
 
 function getServerInfo(baseurl: string, autoConnect: boolean): void {
@@ -98,13 +116,12 @@ function handleServerInfo(data: any, baseurl: string, autoConnect: boolean): voi
     currReq = null;
 
     // Check for server ID change
-    const currentServers = storage.get<ConnectedServers>('connected_servers') || {};
-    for (const id in currentServers) {
-        if (currentServers[id].baseurl === baseurl && currentServers[id].id !== data.Id) {
-            hideConnecting();
-            displayError('The server ID has changed, please check if you are reaching your own server. To connect anyway, click connect again.');
-            delete currentServers[id];
-            storage.set('connected_servers', currentServers);
+    for (const id in savedServers) {
+        if (savedServers[id].baseurl === baseurl && savedServers[id].id !== data.Id) {
+            appUI.showError(strings.errServerIdChanged);
+            delete savedServers[id];
+            storage.set('connected_servers', savedServers);
+            refreshServerList();
             return;
         }
     }
@@ -120,13 +137,14 @@ function handleServerInfo(data: any, baseurl: string, autoConnect: boolean): voi
 
     const updated: ConnectedServers = { [newEntry.id]: newEntry };
     let count = 1;
-    for (const id of Object.keys(currentServers)) {
+    for (const id of Object.keys(savedServers)) {
         if (count >= 4) break;
         if (id !== newEntry.id) {
-            updated[id] = currentServers[id];
+            updated[id] = savedServers[id];
             count++;
         }
     }
+    savedServers = updated;
     storage.set('connected_servers', updated);
 
     // Fetch the web manifest to find the actual entry point
@@ -153,11 +171,10 @@ function handleManifest(data: any, baseurl: string): void {
         : normalizeUrl(baseurl + '/web/' + startUrl);
 
     // Save hosturl to storage
-    const servers = storage.get<ConnectedServers>('connected_servers') || {};
-    for (const id in servers) {
-        if (servers[id].baseurl === baseurl) {
-            servers[id].hosturl = hosturl;
-            storage.set('connected_servers', servers);
+    for (const id in savedServers) {
+        if (savedServers[id].baseurl === baseurl) {
+            savedServers[id].hosturl = hosturl;
+            storage.set('connected_servers', savedServers);
             break;
         }
     }
@@ -168,12 +185,13 @@ function handleManifest(data: any, baseurl: string): void {
 // ===== Iframe Handoff =====
 
 async function handoff(url: string): Promise<void> {
-    const container = document.querySelector('.container') as HTMLElement;
     const frame = document.querySelector('#contentFrame') as HTMLIFrameElement;
     if (!frame) return;
 
-    container?.classList.add('hidden');
-    frame.style.display = 'block';
+    // Free the discovery subscription while the Jellyfin UI is active
+    stopDiscovery();
+
+    appUI.showConnected();
     frame.src = url;
     frame.focus();
 
@@ -191,12 +209,12 @@ async function handoff(url: string): Promise<void> {
     } catch (err) {
         console.error('[Handoff] Iframe failed to load:', err);
         restoreToShell();
-        displayError('The Jellyfin web client failed to load. Check that the server is running and reachable.');
+        appUI.showError(strings.errIframeLoad);
         return;
     }
 
-    // Bind bridge to the iframe
-    bridge.bind(frame);
+    // Bind bridge to the iframe, pinning the expected server origin
+    bridge.bind(frame, originOf(url));
 
     // Load and inject the bridge script into the iframe
     // On actual WebOS this works because the WebView allows the
@@ -247,7 +265,7 @@ async function handoff(url: string): Promise<void> {
     }
 }
 
-// ===== UI Helpers =====
+// ===== Shell State Helpers =====
 
 function abortAction(): void {
     if (currReq) {
@@ -257,48 +275,21 @@ function abortAction(): void {
     handleAbort();
 }
 
-function displayError(message: string): void {
-    const el = document.querySelector('#error');
-    if (el) {
-        (el as HTMLElement).style.display = 'block';
-        el.textContent = message;
-    }
-}
-
-function hideError(): void {
-    const el = document.querySelector('#error');
-    if (el) {
-        (el as HTMLElement).style.display = 'none';
-        el.textContent = '';
-    }
-}
-
-function displayConnecting(): void {
-    document.querySelector('#serverInfoForm')?.classList.add('hidden');
-    document.querySelector('#busy')?.classList.remove('hidden');
-}
-
-function hideConnecting(): void {
-    document.querySelector('#serverInfoForm')?.classList.remove('hidden');
-    document.querySelector('#busy')?.classList.add('hidden');
-}
-
 function handleFailure(err: any): void {
     console.error('Connection failure:', err);
-    hideConnecting();
-    if (err.error === 'timeout') {
-        displayError('The request timed out. Make sure the server is reachable.');
-    } else if (err.error === 'abort') {
-        displayError('The request was aborted.');
-    } else {
-        displayError(`Connection error: ${err.error}`);
-    }
     currReq = null;
+    if (err.error === 'timeout') {
+        appUI.showError(strings.errTimeout);
+    } else if (err.error === 'abort') {
+        appUI.showIdle();
+    } else {
+        appUI.showError(strings.errConnection(err.error));
+    }
 }
 
 function handleAbort(): void {
-    hideConnecting();
     currReq = null;
+    appUI.showIdle();
 }
 
 function backPressed(): void {
@@ -309,14 +300,29 @@ function backPressed(): void {
     }
 }
 
+/**
+ * Free the current iframe's browsing context by replacing the node with a
+ * fresh clone. Setting src='' alone keeps the cross-origin document alive
+ * in some webOS WebView versions; node replacement guarantees release.
+ */
+function resetIframe(): void {
+    const old = document.querySelector('#contentFrame');
+    if (!old || !old.parentNode) return;
+    const fresh = old.cloneNode(false) as HTMLIFrameElement;
+    old.parentNode.replaceChild(fresh, old);
+}
+
 function restoreToShell(): void {
-    const frame = document.querySelector('#contentFrame') as HTMLIFrameElement;
-    if (frame) {
-        frame.style.display = 'none';
-        frame.src = '';
-    }
-    document.querySelector('.container')?.classList.remove('hidden');
-    bridge.destroy();
+    bridge.unbind();
+    allowScreensaver();
+    resetIframe();
+    appUI.restoreToShell();
+    refreshServerList();
+    startDiscovery((servers) => {
+        discovered = servers;
+        refreshServerList();
+    });
+    initNavigation();
 }
 
 // ===== Initialization =====
@@ -344,21 +350,59 @@ function Init(): void {
     }
 
     // Register bridge message handlers
-    bridge.on('selectServer', () => {
+    bridge.on(BridgeInbound.AppHostInit, (data) => {
+        console.log('[Bridge] AppHost.init', data);
+    });
+
+    bridge.on(BridgeInbound.SelectServer, () => {
         console.log('[Bridge] selectServer');
         restoreToShell();
     });
 
-    bridge.on('AppHost.exit', () => {
+    bridge.on(BridgeInbound.AppHostExit, () => {
         console.log('[Bridge] AppHost.exit');
         backPressed();
     });
 
-    bridge.on('_bridgeLoaded', () => {
+    bridge.on(BridgeInbound.EnableFullscreen, () => {
+        const root = document.documentElement;
+        if (root.requestFullscreen) {
+            root.requestFullscreen().catch((err) => console.warn('[Bridge] Fullscreen failed:', err));
+        }
+    });
+
+    bridge.on(BridgeInbound.DisableFullscreen, () => {
+        if (document.fullscreenElement) {
+            document.exitFullscreen().catch((err) => console.warn('[Bridge] Exit fullscreen failed:', err));
+        }
+    });
+
+    bridge.on(BridgeInbound.OpenUrl, (data: { url?: string; target?: string }) => {
+        if (data?.url) {
+            window.open(data.url, data.target || '_blank');
+        }
+    });
+
+    bridge.on(BridgeInbound.DownloadFile, (data: { url?: string }) => {
+        // webOS TV WebView has no download manager; opening the URL lets the
+        // browser app handle it. Media playback stays inside the iframe.
+        console.warn('[Bridge] downloadFile requested, delegating to browser:', data?.url);
+        if (data?.url) window.open(data.url, '_blank');
+    });
+
+    bridge.on(BridgeInbound.UpdateMediaSession, () => {
+        suppressScreensaver();
+    });
+
+    bridge.on(BridgeInbound.HideMediaSession, () => {
+        allowScreensaver();
+    });
+
+    bridge.on(BridgeInbound.BridgeLoaded, () => {
         console.log('[Bridge] iframe bridge script loaded');
     });
 
-    bridge.on('_bridgeReady', () => {
+    bridge.on(BridgeInbound.BridgeReady, () => {
         console.log('[Bridge] iframe bridge script ready');
     });
 
@@ -377,50 +421,62 @@ function Init(): void {
         }
     });
 
-    // Wire up connect button
-    document.querySelector('#connect')?.addEventListener('click', handleServerSelect);
-
-    // Wire up abort button
-    document.querySelector('#abort')?.addEventListener('click', abortAction);
-
-    // Auto-discover servers on the local network
-    discoverServers().then((servers) => {
-        if (servers.length > 0) {
-            console.log('[App] Discovered servers:', servers);
-            const urlField = document.querySelector<HTMLInputElement>('#baseurl');
-            if (urlField && !urlField.value) {
-                // Fill in the first discovered server
-                urlField.value = servers[0].baseurl;
-            }
-        }
+    // Wire up UI state machine (connect/abort buttons)
+    appUI.init({
+        onConnect: (url) => connectToUrl(url),
+        onAbort: () => abortAction()
     });
 
     // Restore saved servers
     // Handle backward compatibility: old installs used 'connected_server' (singular)
-    let savedServers = storage.get<ConnectedServers>('connected_servers');
-    if (!savedServers) {
+    savedServers = storage.get<ConnectedServers>('connected_servers') || {};
+    if (Object.keys(savedServers).length === 0) {
         const oldServers = storage.get<ConnectedServers>('connected_server');
-        if (oldServers) {
+        if (oldServers && Object.keys(oldServers).length > 0) {
             savedServers = oldServers;
             storage.set('connected_servers', oldServers);
             storage.remove('connected_server');
         }
     }
-    if (savedServers) {
-        const keys = Object.keys(savedServers);
-        if (keys.length > 0) {
-            const first = savedServers[keys[0]];
-            const urlField = document.querySelector<HTMLInputElement>('#baseurl');
-            if (urlField) urlField.value = first.baseurl;
 
-            const autoField = document.querySelector<HTMLInputElement>('#auto_connect');
-            if (autoField) autoField.checked = first.auto_connect;
+    if (Object.keys(savedServers).length > 0) {
+        const first = savedServers[Object.keys(savedServers)[0]];
+        const urlField = document.querySelector<HTMLInputElement>('#baseurl');
+        if (urlField) urlField.value = first.baseurl;
 
-            if (first.auto_connect) {
-                handleServerSelect();
-            }
-        }
+        const autoField = document.querySelector<HTMLInputElement>('#auto_connect');
+        if (autoField) autoField.checked = first.auto_connect;
     }
+
+    // Show saved servers right away
+    refreshServerList();
+
+    // Auto-connect without waiting for discovery
+    const first = savedServers[Object.keys(savedServers)[0]];
+    if (first?.auto_connect) {
+        connectToUrl(first.baseurl);
+    }
+
+    // One-shot discovery for the initial list, then live updates
+    discoverServers().then((servers) => {
+        discovered = servers;
+        if (servers.length > 0) {
+            console.log('[App] Discovered servers:', servers.length);
+            refreshServerList();
+        }
+    });
+    startDiscovery((servers) => {
+        discovered = servers;
+        refreshServerList();
+    });
+
+    // App lifecycle: release screensaver suppression when app is hidden
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            console.log('[App] App hidden, allowing screensaver');
+            allowScreensaver();
+        }
+    });
 
     // Initialize navigation
     initNavigation();

@@ -29,3 +29,9 @@ Thumbs.db
 node_modules/
 build/
 yarn.lock
+
+# Vite build output (regenerated from frontend/)
+frontend/dist/
+
+# Local setup documentation
+DEPLOY.md

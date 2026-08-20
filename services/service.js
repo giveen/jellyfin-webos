@@ -77,7 +77,17 @@ function handleDiscoveryResponse(message, remote) {
 
 function sendJellyfinDiscovery() {
 	var msg = Buffer.from(JELLYFIN_DISCOVERY_MESSAGE);
-	client4.send(msg, 0, msg.length, 7359, "255.255.255.255");
+	// Guard the send: after a socket error/close, send() throws asynchronously
+	// and would take the whole service down.
+	try {
+		client4.send(msg, 0, msg.length, 7359, "255.255.255.255", function (err) {
+			if (err) {
+				console.log("Discovery send failed: " + err.message);
+			}
+		});
+	} catch (err) {
+		console.log("Discovery send threw: " + err);
+	}
 
 	// if (client6) {
 	// 	client6.send(msg, 0, msg.length, 7359, "ff08::1"); // All organization-local nodes
@@ -90,6 +100,12 @@ function discoverInitial() {
 		sendJellyfinDiscovery();
 	}
 }
+
+client4.on("error", function (err) {
+	// Without this handler, any socket error (e.g. port already bound by a
+	// stale service instance) throws uncaught and crashes the service.
+	console.log("UDP client error: " + err.message);
+});
 
 client4.on("listening", function () {
 	var address = client4.address();

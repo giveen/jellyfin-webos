@@ -28,14 +28,23 @@ interface WebOSAppInfo {
     [key: string]: any;
 }
 
-interface WebOSServiceRequest {
-    /**
-     * Creates and sends a service request to the system of the webOS TV.
-     * @param service The Luna Service URI (e.g. 'luna://com.webos.service.something')
-     * @param params Parameters object for the service method
-     * @param options Callback or options object
-     */
-    (service: string, params: any, options: any): any;
+interface WebOSServiceRequestOptions {
+    /** Service method name (e.g. 'discover') */
+    method: string;
+    /** Method parameters */
+    parameters?: any;
+    /** Keep the subscription open for multiple responses */
+    subscribe?: boolean;
+    /** Re-subscribe automatically after a service restart */
+    resubscribe?: boolean;
+    onSuccess?: (msg: any) => void;
+    onFailure?: (err: any) => void;
+    onComplete?: () => void;
+}
+
+interface WebOSServiceRequestHandle {
+    /** Cancels a subscribed request */
+    cancel(): void;
 }
 
 interface WebOSKeyboard {
@@ -95,7 +104,7 @@ declare namespace webOS {
 
     /** Service request API */
     const service: {
-        request: WebOSServiceRequest;
+        request(uri: string, options: WebOSServiceRequestOptions): WebOSServiceRequestHandle;
     };
 }
 
